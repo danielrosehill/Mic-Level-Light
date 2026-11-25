@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Mic Level Light
+Comment=See at a glance if the microphone is clipping, good or too low
+Exec=mic-level-light
+Icon=audio-input-microphone
+Categories=AudioVideo;Audio;
+Keywords=microphone;gain;level;clipping;input;meter;
