@@ -16,7 +16,7 @@ Depends: python3, python3-numpy, python3-pyqt6, pulseaudio-utils
 Section: sound
 Priority: optional
 Homepage: https://github.com/danielrosehill/Mic-Level-Light
-Description: One big light for the microphone level
- Shows CLIPPING, TOO LOUD, GOOD or TOO LOW for the chosen input. Read-only.
+Description: Microphone level bar, gain slider and 30-second test
+ Marks the sweet spot for speech recognition.
 C
 dpkg-deb --root-owner-group --build $r dist/mic-level-light_${v}_all.deb

@@ -1,25 +1,29 @@
 #!/usr/bin/python3
-"""Mic Level Light: one big light for the microphone level. Read-only; never changes gain."""
+"""Mic Level Light: a calm microphone level bar, a gain slider and a 30-second test."""
 import json, subprocess, sys
 from collections import deque
 import numpy as np
 
-VERSION = "1.0"
+VERSION = "1.1"
 RATE, BLOCK = 48000, 2400            # 50 ms blocks
-LOW, HIGH = -26.0, -14.0             # speech RMS band, dBFS (100 Hz and up)
-HOT_PEAK, CLIP = -1.5, 0.999         # dBFS, sample magnitude
-STATES = {                           # key: (word, hint, colour)
-    "clip": ("CLIPPING", "Turn the gain down", "#c62828"),
-    "hot":  ("TOO LOUD", "Turn the gain down a little", "#ef6c00"),
-    "good": ("GOOD", "Leave it there", "#2e7d32"),
-    "low":  ("TOO LOW", "Turn the gain up, or move closer", "#1565c0"),
-    "wait": ("SPEAK", "Talk normally for a few seconds", "#424242"),
-    "dead": ("NO SIGNAL", "Is the mic muted or unplugged?", "#212121"),
-}
+LOW, HIGH = -26.0, -14.0             # ASR sweet spot: speech RMS, dBFS (100 Hz and up)
+TARGET, HOT_PEAK, CLIP = -20.0, -1.5, 0.999
+TEST_SECONDS = 30
 
 
 def db(v):
     return 20 * np.log10(max(float(v), 1e-6))
+
+
+def active(rms):
+    """Mask of the blocks that stand above the background (speech)."""
+    rms = np.asarray(rms)
+    floor = np.percentile(rms, 10)
+    return rms > min(max(-55.0, floor + 8), -30.0)
+
+
+def mean_db(levels):
+    return float(10 * np.log10(np.mean(10 ** (np.asarray(levels) / 10))))
 
 
 class Analyser:
@@ -27,42 +31,63 @@ class Analyser:
     def __init__(self):
         self.win = np.hanning(BLOCK)
         self.keep = np.fft.rfftfreq(BLOCK, 1 / RATE) >= 100
-        self.hist = deque(maxlen=200)        # 10 s of (rms_db, peak_db, clipped)
-        self.last_clip = -10**9
-        self.n = 0
-        self.peak_db = self.rms_db = -120.0
-        self.speech_db = None
+        self.hist = deque(maxlen=200)        # 10 s, for the live average
+        self.test = None                     # list while a test runs
+        self.last_clip, self.n = -10**9, 0
+        self.shown = -120.0                  # slow level for the bar
 
     def feed(self, x):
-        peaks = np.abs(x).max(axis=0)
+        peak = float(np.abs(x).max())
         clipped = int((np.abs(x) >= CLIP).sum())
         spec = np.abs(np.fft.rfft(x * self.win[:, None], axis=0)) ** 2
         # Parseval, one-sided, undoing the window power: RMS without rumble below 100 Hz
         ms = 2 * spec[self.keep].sum(axis=0) / (BLOCK * (self.win ** 2).sum())
-        self.peak_db, self.rms_db = db(peaks.max()), db(np.sqrt(ms.max()))
+        row = (db(np.sqrt(ms.max())), db(peak), clipped)
         self.n += 1
         if clipped:
             self.last_clip = self.n
-        self.hist.append((self.rms_db, self.peak_db, clipped))
+        self.hist.append(row)
+        if self.test is not None:
+            self.test.append(row)
+        self.shown += (row[0] - self.shown) * (0.3 if row[0] > self.shown else 0.08)
 
-    def state(self):
-        self.speech_db = None
-        recent = list(self.hist)[-60:]       # 3 s
-        if not recent:
-            return "wait"
-        if self.n - self.last_clip < 40:     # held 2 s
-            return "clip"
-        if len(recent) >= 20 and max(p for _, p, _ in recent) < -80:
-            return "dead"
-        floor = np.percentile([r for r, _, _ in self.hist], 10)
-        gate = min(max(-55.0, floor + 8), -30.0)
-        if sum(r > gate for r, _, _ in recent[-30:]) < 4:
-            return "wait"
-        active = [r for r, _, _ in recent if r > gate]
-        self.speech_db = float(np.percentile(active, 80))
-        if max(p for _, p, _ in recent) > HOT_PEAK or self.speech_db > HIGH:
-            return "hot"
-        return "low" if self.speech_db < LOW else "good"
+    def clipping(self):
+        return self.n - self.last_clip < 60  # held 3 s
+
+    def live_average(self):
+        """Average speech level of the last 10 s, None without about 1 s of speech."""
+        rms = [r for r, _, _ in self.hist]
+        if len(rms) < 20:
+            return None
+        m = active(rms)
+        return mean_db(np.asarray(rms)[m]) if m.sum() >= 20 else None
+
+
+def summarise(rows):
+    """Averages and one recommendation for a finished test."""
+    rms, peaks = np.array([r[0] for r in rows]), np.array([r[1] for r in rows])
+    m = active(rms)
+    out = dict(seconds=len(rows) / 20, speech_seconds=float(m.sum() / 20), peak=float(peaks.max()),
+               clipped=sum(r[2] for r in rows), speech=None, background=None, change=0)
+    if m.sum() < 60:                         # under 3 s of speech
+        out["verdict"] = "Not enough speech to judge. Read aloud for the whole test."
+        return out
+    out["speech"] = mean_db(rms[m])
+    out["background"] = float(np.median(rms[~m])) if (~m).any() else None
+    sp = out["speech"]
+    if out["clipped"]:
+        out["change"] = -max(6, round(sp - TARGET))
+        out["verdict"] = f"Clipping: lower the gain by about {-out['change']} dB, then test again."
+    elif sp > HIGH or out["peak"] > HOT_PEAK:
+        out["change"] = -max(3, round(sp - TARGET))
+        out["verdict"] = f"Too loud: lower the gain by about {-out['change']} dB."
+    elif sp < LOW:
+        out["change"] = max(0, min(round(TARGET - sp), int(-3 - out["peak"])))
+        out["verdict"] = (f"Too quiet: raise the gain by about {out['change']} dB, or move closer." if out["change"]
+                          else "Too quiet on average, but the peaks leave no room for more gain. Move closer.")
+    else:
+        out["verdict"] = "In the sweet spot. Leave it there."
+    return out
 
 
 def run(*cmd):
@@ -81,80 +106,125 @@ def sources():
     for s in rows:
         if s["name"].endswith(".monitor") or s.get("properties", {}).get("device.class") == "monitor":
             continue
-        vols = [v["value_percent"] for v in s.get("volume", {}).values()]
+        vols = list(s.get("volume", {}).values())
         out[s["name"]] = dict(label=s.get("description") or s["name"], mute=s.get("mute", False),
-                              gain=vols[0] if vols else "?",
+                              gain=int(vols[0]["value_percent"].rstrip("%")) if vols else 0,
+                              gain_db=vols[0].get("db", "") if vols else "",
                               ch=max(1, len(s.get("channel_map", "mono").split(","))))
     return out
 
 
 def main():
     from PyQt6.QtCore import QProcess, QRectF, Qt, QTimer
-    from PyQt6.QtGui import QColor, QFont, QIcon, QPainter
-    from PyQt6.QtWidgets import QApplication, QComboBox, QLabel, QVBoxLayout, QWidget
+    from PyQt6.QtGui import QColor, QIcon, QPainter
+    from PyQt6.QtWidgets import (QApplication, QComboBox, QFormLayout, QHBoxLayout, QLabel, QProgressBar,
+                                 QPushButton, QSlider, QVBoxLayout, QWidget)
 
     class Meter(QWidget):
         LO = -60.0
+
         def __init__(self):
             super().__init__()
-            self.level = self.peak = self.hold = -120.0
-            self.setMinimumHeight(64)
+            self.level, self.avg = -120.0, None
+            self.setFixedHeight(96)
 
         def paintEvent(self, _):
             p = QPainter(self)
-            w, h = self.width(), self.height() - 18
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pal, w, top, h = self.palette(), self.width(), 24, 42
             x = lambda v: w * min(1, max(0, (v - self.LO) / -self.LO))
-            for a, b, c in ((self.LO, LOW, "#1565c0"), (LOW, HIGH, "#2e7d32"),
-                            (HIGH, HOT_PEAK, "#ef6c00"), (HOT_PEAK, 0, "#c62828")):
-                col = QColor(c)
-                p.fillRect(QRectF(x(a), 0, x(b) - x(a), h), col.darker(260))
-                if self.level > a:
-                    p.fillRect(QRectF(x(a), 0, x(min(b, self.level)) - x(a), h), col.lighter(130))
-            p.fillRect(QRectF(x(self.hold) - 2, 0, 4, h), QColor("white"))
-            p.setPen(QColor("white"))
+            p.fillRect(QRectF(0, top, w, h), pal.mid())
+            p.fillRect(QRectF(x(LOW), top, x(HIGH) - x(LOW), h), QColor(46, 125, 50, 150))
+            p.fillRect(QRectF(0, top + 14, x(self.level), h - 28), pal.highlight())
+            p.setPen(pal.windowText().color())
+            mid = Qt.AlignmentFlag.AlignCenter
+            p.drawText(QRectF(x(LOW) - 40, 0, x(HIGH) - x(LOW) + 80, 22), mid, "ASR sweet spot")
             for v in (-50, -40, -26, -14, -6):
-                p.drawText(QRectF(x(v) - 25, h, 50, 18), Qt.AlignmentFlag.AlignCenter, str(v))
+                p.drawText(QRectF(x(v) - 25, top + h + 4, 50, 22), mid, str(v))
+            if self.avg is not None:         # average of the last 10 s of speech
+                p.fillRect(QRectF(x(self.avg) - 2, top - 3, 4, h + 6), pal.windowText())
 
     class Window(QWidget):
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Mic Level Light")
-            self.resize(560, 380)
-            self.pick = QComboBox()
-            self.word, self.hint, self.info = QLabel(), QLabel(), QLabel()
-            for lab, size, bold in ((self.word, 56, True), (self.hint, 16, False), (self.info, 11, False)):
-                f = QFont(); f.setPointSize(size); f.setBold(bold)
-                lab.setFont(f); lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.meter = Meter()
+            self.resize(560, 420)
+            self.pick, self.meter = QComboBox(), Meter()
+            self.gain = QSlider(Qt.Orientation.Horizontal)
+            self.gain.setRange(0, 100); self.gain.setSingleStep(1); self.gain.setPageStep(5)
+            self.gain_text, self.live = QLabel(), QLabel()
+            self.gain_text.setMinimumWidth(130)
+            self.button, self.bar = QPushButton(f"Record a {TEST_SECONDS}-second test"), QProgressBar()
+            self.bar.setRange(0, TEST_SECONDS * 20); self.bar.setTextVisible(False)
+            self.result = QLabel("Read aloud normally during the test.")
+            self.result.setWordWrap(True); self.result.setMinimumHeight(120)
+            self.result.setAlignment(Qt.AlignmentFlag.AlignTop)
+            row = QHBoxLayout(); row.addWidget(self.gain, 1); row.addWidget(self.gain_text)
+            form = QFormLayout(); form.addRow("Microphone", self.pick); form.addRow("Gain", row)
             box = QVBoxLayout(self)
-            box.addWidget(self.pick); box.addWidget(self.word, 1)
-            for w in (self.hint, self.meter, self.info):
+            box.addLayout(form); box.addSpacing(8)
+            for w in (self.meter, self.live, self.button, self.bar, self.result):
                 box.addWidget(w)
-            self.proc, self.buf, self.cur, self.ch = None, b"", None, 1
-            self.src, self.shown = {}, None
-            self.an = Analyser()
+            box.addStretch(1)
+            self.proc, self.buf, self.cur, self.ch, self.src = None, b"", None, 1, {}
+            self.an, self.start_gain, self.gain_moved = Analyser(), None, False
+            self.gain_timer = QTimer(self); self.gain_timer.setSingleShot(True); self.gain_timer.setInterval(120)
+            self.gain_timer.timeout.connect(self.set_gain)
+            self.gain.valueChanged.connect(self.gain_changed)
             self.pick.currentIndexChanged.connect(self.poll)
+            self.button.clicked.connect(self.toggle_test)
             self.poll()
-            for ms, fn in ((2000, self.poll), (60, self.draw)):
+            for ms, fn in ((1500, self.poll), (60, self.draw), (1000, self.text)):
                 t = QTimer(self); t.timeout.connect(fn); t.start(ms)
+            self.text()
 
+        # gain
+        def gain_changed(self, v):
+            self.gain_text.setText(f"{v}%")
+            self.gain_timer.start()
+
+        def set_gain(self):
+            if self.cur in self.src:
+                run("pactl", "set-source-volume", self.cur, f"{self.gain.value()}%")
+                self.poll()
+
+        def show_gain(self):
+            s = self.src.get(self.cur)
+            testing = self.an.test is not None
+            self.gain.setEnabled(bool(s) and not testing)
+            if not s:
+                self.gain_text.setText("–")
+                return
+            if testing and s["gain"] != self.start_gain:
+                self.gain_moved = True
+            if self.gain.isSliderDown() or self.gain_timer.isActive():
+                return
+            self.gain.blockSignals(True)
+            self.gain.setValue(min(100, s["gain"]))
+            self.gain.blockSignals(False)
+            self.gain_text.setText(f"{s['gain']}%  {s['gain_db']}" + ("  MUTED" if s["mute"] else ""))
+
+        # source
         def poll(self):
             self.src = sources()
             chosen = self.pick.currentData() or ""
-            want = [("", "System default microphone")] + [(n, s["label"]) for n, s in self.src.items()]
+            default = run("pactl", "get-default-source")
+            label = self.src.get(default, {}).get("label", "none")
+            want = [("", f"Default: {label}")] + [(n, s["label"]) for n, s in self.src.items()]
             have = [(self.pick.itemData(i), self.pick.itemText(i)) for i in range(self.pick.count())]
             if want != have:
                 self.pick.blockSignals(True)
                 self.pick.clear()
-                for n, label in want:
-                    self.pick.addItem(label, n)
+                for n, text in want:
+                    self.pick.addItem(text, n)
                 self.pick.setCurrentIndex(max(0, self.pick.findData(chosen)))
                 self.pick.blockSignals(False)
                 chosen = self.pick.currentData()
-            name = chosen or run("pactl", "get-default-source")
+            name = chosen or default
             alive = self.proc and self.proc.state() != QProcess.ProcessState.NotRunning
             if name != self.cur or not alive:
                 self.open(name)
+            self.show_gain()
 
         def stop(self):
             if self.proc:
@@ -164,9 +234,11 @@ def main():
                 self.proc = None
 
         def open(self, name):
+            if self.an.test is not None:
+                self.end_test("Test stopped: the microphone changed.")
             self.stop()
+            self.gain_timer.stop()           # never send a pending gain to a different mic
             self.cur, self.buf, self.an = name, b"", Analyser()
-            self.meter.hold = -120.0
             if name not in self.src:
                 return
             self.ch = self.src[name]["ch"]
@@ -182,22 +254,52 @@ def main():
             while len(self.buf) >= size:
                 self.an.feed(np.frombuffer(self.buf[:size], "<f4").reshape(-1, self.ch))
                 self.buf = self.buf[size:]
-                self.meter.hold = max(self.an.peak_db, self.meter.hold - 0.6)
+                if self.an.test is not None and len(self.an.test) >= TEST_SECONDS * 20:
+                    self.finish()
 
+        # test
+        def toggle_test(self):
+            if self.an.test is not None:
+                self.end_test("Test cancelled.")
+            elif self.cur in self.src:
+                self.start_gain, self.gain_moved, self.an.test = self.src[self.cur]["gain"], False, []
+                self.button.setText("Cancel test")
+                self.result.setText("Recording. Read aloud normally.")
+                self.show_gain()
+
+        def end_test(self, text):
+            self.an.test = None
+            self.bar.setValue(0)
+            self.button.setText(f"Record a {TEST_SECONDS}-second test")
+            self.result.setText(text)
+            self.show_gain()
+
+        def finish(self):
+            r = summarise(self.an.test)
+            if r["change"] > 0 and self.src.get(self.cur, {}).get("gain", 0) >= 100:
+                r["verdict"] = (f"Too quiet by about {r['change']} dB, and the gain here is at its maximum. "
+                                "Turn up the dial on the mic, or move closer.")
+            f = lambda v: "–" if v is None else f"{v:.0f} dBFS"
+            text = (f"<p><b>{r['verdict']}</b></p>Average speech: <b>{f(r['speech'])}</b> (sweet spot {LOW:.0f} to {HIGH:.0f})"
+                    f"<br>Highest peak: {f(r['peak'])}<br>Clipped samples: {r['clipped']}"
+                    f"<br>Background: {f(r['background'])}<br>Speech heard: {r['speech_seconds']:.0f} of {r['seconds']:.0f} s")
+            if self.gain_moved:
+                text += "<p>The gain changed during this test (another program moved it), so these averages mix two settings.</p>"
+            self.end_test(text)
+
+        # display
         def draw(self):
-            s = self.src.get(self.cur)
-            st = "dead" if s is None or s["mute"] else self.an.state()
-            word, hint, col = STATES[st]
-            if st != self.shown:
-                self.shown = st
-                self.word.setText(word); self.hint.setText(hint)
-                self.setStyleSheet(f"Window, QWidget {{ background: {col}; color: white; }}")
-            m = self.meter
-            m.level = max(self.an.rms_db, m.level - 2)
-            m.update()
-            sp = "–" if self.an.speech_db is None else f"{self.an.speech_db:.0f}"
-            self.info.setText(f"speech {sp} dBFS (aim for -26 to -14)    peak {m.hold:.0f} dBFS    "
-                              f"system gain {s['gain'] if s else '–'}" + ("    MUTED" if s and s["mute"] else ""))
+            self.meter.level, self.meter.avg = self.an.shown, self.avg
+            self.meter.update()
+            if self.an.test is not None:
+                self.bar.setValue(len(self.an.test))
+
+        def text(self):
+            self.avg = self.an.live_average()
+            t = "Speech average, last 10 s: " + ("–" if self.avg is None else f"{self.avg:.0f} dBFS")
+            self.live.setText(t + ("      <b>clipped</b>" if self.an.clipping() else ""))
+
+        avg = None
 
         def closeEvent(self, e):
             self.stop()
